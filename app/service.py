@@ -17,6 +17,20 @@
   version_conflict；“读取当前版本 -> 校验 -> 追加下一版本”在同一个
   BEGIN IMMEDIATE 事务内完成，竞争请求只有一个能成功。
 
+批量更正（correction_batches/correction_batch_items）不变式：
+- 每批 1~100 项，同一批内 seq 必须互不相同，重复 seq 整批拒绝（409
+  batch_conflict，冲突明细按输入顺序返回）且零写入；
+- “逐项核对（已定稿字幕、非缺口、expected_version 等于当前版本）->
+  按输入顺序追加各序号的新更正版本 -> 记录批次与逐项冻结结果”全部在
+  单个 BEGIN IMMEDIATE 事务内完成；任一项校验失败即整批回滚，
+  corrections 表不增加任何版本；
+- (channel, idempotency_key) 唯一：相同频道、相同幂等键且请求内容
+  （逐项 seq/expected_version/text/reason 及输入顺序，经指纹比对）
+  完全相同时重试，原样返回原批次结果（idempotent=true，同一 batch_id）；
+  键相同而内容不同返回 409 idempotency_key_conflict；
+- 幂等记录只追加：correction_batches / correction_batch_items 与
+  corrections 一样在存储层禁止 UPDATE/DELETE。
+
 发布快照（snapshots/snapshot_items/snapshot_corrections）不变式：
 - “锁定当前 watermark -> 固化 1..watermark 的字幕 / 缺口及各条更正
   历史 -> 写入快照”在单个 BEGIN IMMEDIATE 事务内完成，冻结结果与
@@ -48,6 +62,8 @@
   失败时不改写消费者状态。
 """
 
+import hashlib
+import json
 import sqlite3
 import time
 import uuid
@@ -59,11 +75,19 @@ from .db import read_tx, write_tx
 class CorrectionError(Exception):
     """更正 / 审计请求在业务前置条件上被拒绝；HTTP 层映射为 409/404。"""
 
-    def __init__(self, error: str, message: str, status_code: int = 409):
+    def __init__(
+        self,
+        error: str,
+        message: str,
+        status_code: int = 409,
+        extra: "dict | None" = None,
+    ):
         super().__init__(message)
         self.error = error
         self.message = message
         self.status_code = status_code
+        # 附加字段（如批量更正的逐项 conflicts），原样并入错误响应体
+        self.extra = extra
 
 
 class SnapshotError(Exception):
@@ -567,6 +591,234 @@ def list_corrections(channel: str, seq: int) -> dict:
                 for row in rows
             ],
         }
+
+
+# ---------- 批量更正 ----------
+
+
+def _batch_request_fingerprint(items: list) -> str:
+    """对整批请求按输入顺序做指纹：字段含 seq/expected_version/text/reason。
+
+    text/reason 为经 schema 去除首尾空白后的字符串；JSON 以确定性分隔符
+    序列化（ensure_ascii=False、无多余空白），使“完全相同请求”逐字节可比。
+    """
+    payload = [
+        [item["seq"], item["expected_version"], item["text"], item["reason"]]
+        for item in items
+    ]
+    blob = json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":"), sort_keys=False
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+
+def submit_correction_batch(channel: str, idempotency_key: str, items: list) -> dict:
+    """在单个写事务内原子提交一批（1~100 条）追加式更正。
+
+    先按幂等键查既有批次：完全相同请求（指纹一致）原样返回原批次结果，
+    键相同而内容不同抛 idempotency_key_conflict。随后逐项核对——同批
+    重复 seq、未定稿序号、缺口序号、expected_version 不匹配均收集为
+    冲突项；任一项失败则整批拒绝（不插入任何更正版本），冲突明细按
+    输入顺序返回。全部通过才按输入顺序追加各序号的新版本并冻结批次
+    记录，返回 batch_id 与逐项结果。
+    """
+    fingerprint = _batch_request_fingerprint(items)
+
+    with write_tx() as conn:
+        existing = conn.execute(
+            "SELECT batch_id, created_at, request_fingerprint FROM correction_batches "
+            "WHERE channel = ? AND idempotency_key = ?",
+            (channel, idempotency_key),
+        ).fetchone()
+        if existing is not None:
+            if existing["request_fingerprint"] != fingerprint:
+                raise CorrectionError(
+                    "idempotency_key_conflict",
+                    f"频道 {channel} 的幂等键 {idempotency_key} 已被内容不同的请求占用，"
+                    "请更换幂等键后重试",
+                )
+            return _replay_batch(conn, existing, channel, idempotency_key)
+
+        # 逐项核对：任何一项失败都不写入，冲突按输入顺序收集
+        seen: "dict[int, int]" = {}
+        conflicts = []
+        for index, item in enumerate(items):
+            seq = item["seq"]
+            if seq in seen:
+                conflicts.append(
+                    {
+                        "index": index,
+                        "seq": seq,
+                        "error": "duplicate_seq",
+                        "message": (
+                            f"序号 {seq} 在本批中重复：与第 {seen[seq]} 项"
+                            "（下标从 0 起）序号相同"
+                        ),
+                    }
+                )
+                continue
+
+            finalized = conn.execute(
+                "SELECT 1 FROM finalized WHERE channel = ? AND seq = ?",
+                (channel, seq),
+            ).fetchone()
+            if finalized is None:
+                gap = conn.execute(
+                    "SELECT 1 FROM gaps WHERE channel = ? AND seq = ?",
+                    (channel, seq),
+                ).fetchone()
+                if gap is not None:
+                    err, msg = (
+                        "seq_is_gap",
+                        f"序号 {seq} 已裁决为永久缺口，不能更正",
+                    )
+                else:
+                    err, msg = (
+                        "not_finalized",
+                        f"序号 {seq} 尚未定稿，只有已定稿字幕允许更正",
+                    )
+            else:
+                current = conn.execute(
+                    "SELECT COALESCE(MAX(version), 0) AS v FROM corrections "
+                    "WHERE channel = ? AND seq = ?",
+                    (channel, seq),
+                ).fetchone()["v"]
+                if item["expected_version"] != current:
+                    err, msg = (
+                        "version_conflict",
+                        f"第 {index} 项 expected_version="
+                        f"{item['expected_version']} 与序号 {seq} 的当前更正版本 "
+                        f"{current} 不一致",
+                    )
+                else:
+                    err, msg = None, None
+
+            if err is not None:
+                conflicts.append(
+                    {"index": index, "seq": seq, "error": err, "message": msg}
+                )
+            else:
+                seen[seq] = index
+
+        if conflicts:
+            raise CorrectionError(
+                "batch_conflict",
+                f"{len(conflicts)} 个更正项未通过校验，整批拒绝且无任何写入",
+                extra={"conflicts": conflicts},
+            )
+
+        # 全部通过：批次行先落库（UNIQUE(channel, idempotency_key) 是并发
+        # 重试的最后防线），再按输入顺序逐项追加更正版本并冻结结果
+        batch_id = str(uuid.uuid4())
+        try:
+            conn.execute(
+                "INSERT INTO correction_batches "
+                "(batch_id, channel, idempotency_key, request_fingerprint) "
+                "VALUES (?, ?, ?, ?)",
+                (batch_id, channel, idempotency_key, fingerprint),
+            )
+        except sqlite3.IntegrityError:
+            # 极端并发下另一请求已用同键提交：重读既有批次，内容相同则
+            # 幂等返回，不同则冲突（本事务随即随异常回滚，零写入）
+            existing = conn.execute(
+                "SELECT batch_id, created_at, request_fingerprint "
+                "FROM correction_batches WHERE channel = ? AND idempotency_key = ?",
+                (channel, idempotency_key),
+            ).fetchone()
+            if existing["request_fingerprint"] == fingerprint:
+                return _replay_batch(conn, existing, channel, idempotency_key)
+            raise CorrectionError(
+                "idempotency_key_conflict",
+                f"频道 {channel} 的幂等键 {idempotency_key} 已被内容不同的请求占用，"
+                "请更换幂等键后重试",
+            )
+
+        results = []
+        for index, item in enumerate(items):
+            seq = item["seq"]
+            next_version = item["expected_version"] + 1
+            try:
+                row = conn.execute(
+                    "INSERT INTO corrections (channel, seq, version, text, reason) "
+                    "VALUES (?, ?, ?, ?, ?) RETURNING created_at",
+                    (
+                        channel,
+                        seq,
+                        next_version,
+                        item["text"],
+                        item["reason"],
+                    ),
+                ).fetchone()
+            except sqlite3.IntegrityError as exc:  # 极端竞争下的最后防线
+                raise CorrectionError(
+                    "version_conflict",
+                    f"序号 {seq} 的更正版本 {next_version} 已被并发请求占用，整批拒绝",
+                ) from exc
+            conn.execute(
+                "INSERT INTO correction_batch_items "
+                "(batch_id, item_index, seq, expected_version, correction_version, "
+                "text, reason, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    batch_id,
+                    index,
+                    seq,
+                    item["expected_version"],
+                    next_version,
+                    item["text"],
+                    item["reason"],
+                    row["created_at"],
+                ),
+            )
+            results.append(
+                {
+                    "index": index,
+                    "seq": seq,
+                    "correction_version": next_version,
+                    "text": item["text"],
+                    "reason": item["reason"],
+                    "created_at": row["created_at"],
+                }
+            )
+
+        created_at = conn.execute(
+            "SELECT created_at FROM correction_batches WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchone()["created_at"]
+        return {
+            "batch_id": batch_id,
+            "channel": channel,
+            "idempotency_key": idempotency_key,
+            "idempotent": False,
+            "created_at": created_at,
+            "results": results,
+        }
+
+
+def _replay_batch(conn, batch_row, channel: str, idempotency_key: str) -> dict:
+    """按冻结的批次逐项记录构造原样重试响应（只读，不追加任何更正版本）。"""
+    rows = conn.execute(
+        "SELECT item_index, seq, correction_version, text, reason, created_at "
+        "FROM correction_batch_items WHERE batch_id = ? ORDER BY item_index",
+        (batch_row["batch_id"],),
+    ).fetchall()
+    return {
+        "batch_id": batch_row["batch_id"],
+        "channel": channel,
+        "idempotency_key": idempotency_key,
+        "idempotent": True,
+        "created_at": batch_row["created_at"],
+        "results": [
+            {
+                "index": row["item_index"],
+                "seq": row["seq"],
+                "correction_version": row["correction_version"],
+                "text": row["text"],
+                "reason": row["reason"],
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ],
+    }
 
 
 # ---------- 发布快照 ----------

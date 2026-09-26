@@ -9,6 +9,9 @@ from .db import init_db
 from .schemas import (
     AckIn,
     AckResponse,
+    BatchCorrectionErrorResponse,
+    BatchCorrectionIn,
+    BatchCorrectionResponse,
     ClaimIn,
     ClaimResponse,
     ConsumerStatusResponse,
@@ -42,17 +45,17 @@ app = FastAPI(
     title="Live Subtitle Finalizer",
     summary="直播字幕定稿服务：乱序片段缓冲、按连续前缀推进水位线并定稿；"
     "支持追加式更正、不可变发布快照与命名消费者拉取游标",
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
 
 @app.exception_handler(service.CorrectionError)
 def correction_error_handler(request, exc: service.CorrectionError) -> JSONResponse:
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"error": exc.error, "message": exc.message},
-    )
+    content = {"error": exc.error, "message": exc.message}
+    if exc.extra:
+        content.update(exc.extra)
+    return JSONResponse(status_code=exc.status_code, content=content)
 
 
 @app.exception_handler(service.SnapshotError)
@@ -143,6 +146,42 @@ def submit_correction(channel: str, seq: int, body: CorrectionIn) -> dict:
 def list_corrections(channel: str, seq: int) -> dict:
     """查询某定稿序号的全部更正记录，按更正版本（version）升序返回。"""
     return service.list_corrections(channel, seq)
+
+
+@app.post(
+    "/channels/{channel}/corrections/batch",
+    response_model=BatchCorrectionResponse,
+    status_code=200,
+    responses={
+        409: {
+            "description": (
+                "批次内存在冲突项（batch_conflict：未定稿/缺口/版本不符/批内重复 seq，"
+                "整批零写入，conflicts 按输入顺序逐项给出）；"
+                "或幂等键已被不同内容的请求占用（idempotency_key_conflict）"
+            ),
+            "model": BatchCorrectionErrorResponse,
+        },
+        422: {"description": "请求体校验失败（条数越界、字段非法等）"},
+    },
+)
+def submit_correction_batch(channel: str, body: BatchCorrectionIn) -> dict:
+    """对已定稿字幕批量追加不可变更正（单事务，全成或全败）。
+
+    - 请求体含 1~100 条 `corrections`，每项带 seq、expected_version、
+      text、reason，并携带频道范围内的 idempotency_key；
+    - 同一批内 seq 重复即整批拒绝；单个写事务内逐项核对“确为已定稿
+      字幕且非缺口、expected_version 等于当前版本”，任一项失败都按
+      输入顺序在 409 `batch_conflict` 的 `conflicts` 中返回各项冲突
+      原因，整批零写入；
+    - 全部通过才按输入顺序为各序号追加新的更正版本，返回 batch_id
+      与逐项 results；
+    - 相同频道、相同幂等键且请求完全相同时重试，原样返回原批次结果
+      （同一 batch_id、`idempotent=true`）；键相同而内容不同返回 409
+      `idempotency_key_conflict`；
+    - 单条更正接口与定稿原文视图不受影响，仍可正常使用。
+    """
+    items = [item.model_dump() for item in body.corrections]
+    return service.submit_correction_batch(channel, body.idempotency_key, items)
 
 
 # ---------- 发布快照 ----------

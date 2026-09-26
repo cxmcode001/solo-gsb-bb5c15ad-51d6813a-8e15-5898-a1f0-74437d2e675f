@@ -89,6 +89,58 @@ BEGIN
     SELECT RAISE(ABORT, 'corrections is append-only: DELETE is forbidden');
 END;
 
+-- 批量更正批次：每批一个 UUID batch_id。(channel, idempotency_key) 唯一：
+-- 相同频道 + 相同幂等键 + 完全相同请求（request_fingerprint 一致）重试
+-- 原样返回原批次；键相同而内容不同在应用层拒绝。批次表只追加，不可变。
+CREATE TABLE IF NOT EXISTS correction_batches (
+    batch_id            TEXT PRIMARY KEY,
+    channel             TEXT NOT NULL,
+    idempotency_key     TEXT NOT NULL,
+    request_fingerprint TEXT NOT NULL,
+    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (channel, idempotency_key)
+);
+
+-- 批量更正逐项冻结记录：按输入顺序（item_index 从 0 起）记录每项的
+-- seq / expected_version / 追加后的 correction_version / text / reason，
+-- 供幂等重试逐字原样返回。只追加，不可变。
+CREATE TABLE IF NOT EXISTS correction_batch_items (
+    batch_id           TEXT NOT NULL,
+    item_index         INTEGER NOT NULL,
+    seq                INTEGER NOT NULL,
+    expected_version   INTEGER NOT NULL,
+    correction_version INTEGER NOT NULL,
+    text               TEXT NOT NULL,
+    reason             TEXT NOT NULL,
+    created_at         TEXT NOT NULL,
+    PRIMARY KEY (batch_id, item_index),
+    FOREIGN KEY (batch_id) REFERENCES correction_batches (batch_id)
+);
+
+CREATE TRIGGER IF NOT EXISTS correction_batches_no_update
+BEFORE UPDATE ON correction_batches
+BEGIN
+    SELECT RAISE(ABORT, 'correction_batches are immutable: UPDATE is forbidden');
+END;
+
+CREATE TRIGGER IF NOT EXISTS correction_batches_no_delete
+BEFORE DELETE ON correction_batches
+BEGIN
+    SELECT RAISE(ABORT, 'correction_batches are immutable: DELETE is forbidden');
+END;
+
+CREATE TRIGGER IF NOT EXISTS correction_batch_items_no_update
+BEFORE UPDATE ON correction_batch_items
+BEGIN
+    SELECT RAISE(ABORT, 'correction_batch_items are immutable: UPDATE is forbidden');
+END;
+
+CREATE TRIGGER IF NOT EXISTS correction_batch_items_no_delete
+BEFORE DELETE ON correction_batch_items
+BEGIN
+    SELECT RAISE(ABORT, 'correction_batch_items are immutable: DELETE is forbidden');
+END;
+
 -- 发布快照：创建时刻在同一事务内冻结频道 watermark。下游按 snapshot_id
 -- 分批拉取，后续字幕 / 更正 / 缺口只写入原表，任何既有快照都不再变化。
 -- idempotency_key 在频道范围内唯一：重试同一 key 必须返回同一快照。

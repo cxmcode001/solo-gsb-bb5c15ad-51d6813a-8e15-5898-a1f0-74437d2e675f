@@ -21,6 +21,10 @@ def clean_db():
         # 删除后由 init_db() 幂等重建
         conn.execute("DROP TRIGGER IF EXISTS corrections_no_delete")
         conn.execute("DROP TRIGGER IF EXISTS corrections_no_update")
+        conn.execute("DROP TRIGGER IF EXISTS correction_batch_items_no_delete")
+        conn.execute("DROP TRIGGER IF EXISTS correction_batch_items_no_update")
+        conn.execute("DROP TRIGGER IF EXISTS correction_batches_no_delete")
+        conn.execute("DROP TRIGGER IF EXISTS correction_batches_no_update")
         conn.execute("DROP TRIGGER IF EXISTS snapshot_corrections_no_delete")
         conn.execute("DROP TRIGGER IF EXISTS snapshot_corrections_no_update")
         conn.execute("DROP TRIGGER IF EXISTS snapshot_items_no_delete")
@@ -31,6 +35,9 @@ def clean_db():
         conn.execute("DELETE FROM snapshot_corrections")
         conn.execute("DELETE FROM snapshot_items")
         conn.execute("DELETE FROM snapshots")
+        # 批量更正逐项记录先于批次删除（外键）
+        conn.execute("DELETE FROM correction_batch_items")
+        conn.execute("DELETE FROM correction_batches")
         conn.execute("DELETE FROM corrections")
         conn.execute("DELETE FROM finalized")
         conn.execute("DELETE FROM fragments")

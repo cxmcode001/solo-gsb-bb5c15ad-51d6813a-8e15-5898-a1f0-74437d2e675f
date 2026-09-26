@@ -151,6 +151,103 @@ class CorrectionAuditResponse(BaseModel):
     )
 
 
+# ---------- 批量更正 ----------
+
+
+class BatchCorrectionItemIn(BaseModel):
+    seq: int = Field(..., ge=1, description="被更正的定稿序号（必须已定稿且不是缺口）")
+    expected_version: int = Field(
+        ...,
+        ge=0,
+        description="客户端认为的当前更正版本：无更正时必须为 0，否则须等于该序号最新版本",
+    )
+    text: str = Field(..., min_length=1, description="更正后的字幕文本")
+    reason: str = Field(..., min_length=1, description="更正原因（随审计记录永久保留）")
+
+    @field_validator("text", "reason")
+    @classmethod
+    def _strip_and_require_nonblank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("不得为空白字符串")
+        return v
+
+
+class BatchCorrectionIn(BaseModel):
+    idempotency_key: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "幂等键（频道范围内唯一）：相同频道、相同键且请求完全相同时重试，"
+            "始终返回原批次结果；键相同而内容不同返回 409 冲突"
+        ),
+    )
+    corrections: List[BatchCorrectionItemIn] = Field(
+        ..., min_length=1, max_length=100, description="本批更正项，按输入顺序处理（1~100 条）"
+    )
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _strip_and_require_nonblank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("不得为空白字符串")
+        return v
+
+
+class BatchCorrectionResultItem(BaseModel):
+    index: int = Field(..., description="该项在请求 corrections 数组中的下标（从 0 起，按输入顺序）")
+    seq: int = Field(..., description="被更正的定稿序号")
+    correction_version: int = Field(
+        ..., description="本次追加后该序号的更正版本（首个更正为 1）"
+    )
+    text: str = Field(..., description="本次更正文本（原始定稿仍可经 view=original 查询）")
+    reason: str
+    created_at: str = Field(..., description="更正落库时间（UTC ISO8601）")
+
+
+class BatchCorrectionResponse(BaseModel):
+    batch_id: str = Field(..., description="批次号（UUID），同键完全相同请求重试返回同一批次号")
+    channel: str
+    idempotency_key: str
+    idempotent: bool = Field(
+        ...,
+        description="false=本次新建批次；true=相同幂等键且完全相同请求重试，返回原批次结果",
+    )
+    created_at: str = Field(..., description="批次创建时间（UTC ISO8601）")
+    results: List[BatchCorrectionResultItem] = Field(
+        ..., description="逐项更正结果，顺序与请求 corrections 数组一致"
+    )
+
+
+class BatchCorrectionConflictItem(BaseModel):
+    index: int = Field(..., description="该项在请求 corrections 数组中的下标（从 0 起，按输入顺序）")
+    seq: int
+    error: str = Field(
+        ...,
+        description=(
+            "冲突原因：not_finalized=序号未定稿；seq_is_gap=序号为永久缺口；"
+            "version_conflict=expected_version 与当前版本不一致；"
+            "duplicate_seq=与本批更靠前的某项序号重复"
+        ),
+    )
+    message: str
+
+
+class BatchCorrectionErrorResponse(BaseModel):
+    error: str = Field(
+        ...,
+        description=(
+            "错误码：batch_conflict=批次内存在冲突项（整批拒绝、零写入），明细见 conflicts；"
+            "idempotency_key_conflict=相同频道下该幂等键已被不同请求占用"
+        ),
+    )
+    message: str
+    conflicts: Optional[List[BatchCorrectionConflictItem]] = Field(
+        None, description="error=batch_conflict 时的逐项冲突原因，按输入顺序返回"
+    )
+
+
 class ErrorResponse(BaseModel):
     error: str = Field(..., description="错误码")
     message: str
