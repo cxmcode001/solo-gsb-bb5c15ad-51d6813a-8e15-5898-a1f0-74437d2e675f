@@ -1,0 +1,14 @@
+services:
+  subtitles:
+    build: .
+    image: subtitle-finalizer:latest
+    ports:
+      - "8000:8000"
+    environment:
+      DB_PATH: /data/subtitles.db
+    volumes:
+      - subtitles-data:/data
+    restart: unless-stopped
+
+volumes:
+  subtitles-data:
