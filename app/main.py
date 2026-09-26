@@ -9,6 +9,9 @@ from .db import init_db
 from .schemas import (
     AckIn,
     AckResponse,
+    BatchConflictResponse,
+    BatchCorrectionIn,
+    BatchCorrectionResponse,
     ClaimIn,
     ClaimResponse,
     ConsumerStatusResponse,
@@ -41,18 +44,19 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Live Subtitle Finalizer",
     summary="直播字幕定稿服务：乱序片段缓冲、按连续前缀推进水位线并定稿；"
-    "支持追加式更正、不可变发布快照与命名消费者拉取游标",
-    version="1.3.0",
+    "支持追加式更正（单条与整批原子的批量）、不可变发布快照与命名消费者拉取游标",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
 
 @app.exception_handler(service.CorrectionError)
 def correction_error_handler(request, exc: service.CorrectionError) -> JSONResponse:
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"error": exc.error, "message": exc.message},
-    )
+    content = {"error": exc.error, "message": exc.message}
+    if exc.items is not None:
+        # 批量更正的 batch_conflict：附带按输入顺序排列的逐项冲突原因
+        content["items"] = exc.items
+    return JSONResponse(status_code=exc.status_code, content=content)
 
 
 @app.exception_handler(service.SnapshotError)
@@ -143,6 +147,38 @@ def submit_correction(channel: str, seq: int, body: CorrectionIn) -> dict:
 def list_corrections(channel: str, seq: int) -> dict:
     """查询某定稿序号的全部更正记录，按更正版本（version）升序返回。"""
     return service.list_corrections(channel, seq)
+
+
+@app.post(
+    "/channels/{channel}/corrections/batch",
+    response_model=BatchCorrectionResponse,
+    status_code=200,
+    responses={
+        409: {
+            "description": "批内重复 seq / 幂等键内容冲突 / 逐项校验失败（整批零写入）",
+            "model": BatchConflictResponse,
+        },
+        422: {"description": "请求体校验失败（条数越界、字段为空等）"},
+    },
+)
+def submit_correction_batch(channel: str, body: BatchCorrectionIn) -> dict:
+    """批量追加更正（1～100 条，整批原子）。
+
+    - 单个 `BEGIN IMMEDIATE` 事务内逐项核对“序号确为已定稿字幕（非缺口）、
+      `expected_version` 等于当前版本”；任一项失败整批零写入，
+      按输入顺序返回各项冲突原因（409 `batch_conflict`）；
+    - 全部通过才按输入顺序逐项追加新更正版本，返回批次号 `batch_id`
+      与逐项结果；
+    - 批内重复 `seq` 直接拒绝（409 `duplicate_seq`）；
+    - 同一频道相同 `idempotency_key` + 完全相同请求的重试返回原批次结果
+      （`idempotent=true`）；键相同而内容不同返回 409
+      `idempotency_key_conflict`；校验失败的批次不占幂等键。
+    """
+    return service.submit_correction_batch(
+        channel,
+        body.idempotency_key,
+        [item.model_dump() for item in body.items],
+    )
 
 
 # ---------- 发布快照 ----------

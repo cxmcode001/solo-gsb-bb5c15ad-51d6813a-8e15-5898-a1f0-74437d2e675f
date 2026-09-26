@@ -1,6 +1,6 @@
 # Live Subtitle Finalizer — 直播字幕定稿服务
 
-基于 FastAPI + SQLite 的直播字幕定稿服务。客户端按频道提交带**序号 / 修订号 / 文本**的字幕片段，服务将乱序到达的片段放入缓冲区，只从序号 1 起按**连续前缀**推进水位线并生成**不可再修改**的定稿字幕。操作员可对确认永久丢失的序号区间发起**缺口裁决**，服务在同一事务中记录缺口并释放紧随其后的连续缓冲片段。定稿之后如需改字，可通过**追加式更正层**提交不可变的更正版本——原始定稿永远保留，下游可在原始视图与生效视图之间选择。需要让下游分批拉取**同一时刻的稳定字幕**时，可对频道**发布快照**：单事务锁定水位线并冻结 1..watermark 的原始 / 生效结果、缺口标记与各条更正版本，此后任何定稿、更正或缺口都不会改变既有快照；任意两个同频道快照还可经**快照差异接口**按 seq 合并比较，只返回新增 / 移除 / 内容变更的条目。下游也可以注册**命名消费者拉取游标**：每个命名消费者在频道内持有独立的已确认游标，领取接口在事务中返回游标后的连续批次（含缺口标记）并签发带过期时间的租约令牌，确认后游标才推进；租约过期未确认的批次可被重新领取，实现至少一次交付。
+基于 FastAPI + SQLite 的直播字幕定稿服务。客户端按频道提交带**序号 / 修订号 / 文本**的字幕片段，服务将乱序到达的片段放入缓冲区，只从序号 1 起按**连续前缀**推进水位线并生成**不可再修改**的定稿字幕。操作员可对确认永久丢失的序号区间发起**缺口裁决**，服务在同一事务中记录缺口并释放紧随其后的连续缓冲片段。定稿之后如需改字，可通过**追加式更正层**提交不可变的更正版本——原始定稿永远保留，下游可在原始视图与生效视图之间选择；多条更正还可经**批量更正接口**一次提交 1～100 条，整批在单个事务内原子核对与写入，并凭幂等键安全重试。需要让下游分批拉取**同一时刻的稳定字幕**时，可对频道**发布快照**：单事务锁定水位线并冻结 1..watermark 的原始 / 生效结果、缺口标记与各条更正版本，此后任何定稿、更正或缺口都不会改变既有快照；任意两个同频道快照还可经**快照差异接口**按 seq 合并比较，只返回新增 / 移除 / 内容变更的条目。下游也可以注册**命名消费者拉取游标**：每个命名消费者在频道内持有独立的已确认游标，领取接口在事务中返回游标后的连续批次（含缺口标记）并签发带过期时间的租约令牌，确认后游标才推进；租约过期未确认的批次可被重新领取，实现至少一次交付。
 
 ## 语义规则
 
@@ -26,6 +26,15 @@
 - 版本不匹配（含并发竞争失败）返回 409 `version_conflict`；校验与追加在同一 `BEGIN IMMEDIATE` 事务内原子完成。
 - 定稿查询默认 `view=original`（响应结构不变）；`view=effective` 合并最新更正文本并返回每条字幕的 `correction_version`。
 - 更正历史可通过审计接口按版本升序查询。
+
+### 批量更正规则
+
+- 批量接口一次接收 **1～100 条**更正（每条含 `seq`、`expected_version`、`text`、`reason`）外加一个 `idempotency_key`；同一批内**重复 `seq` 整批拒绝**（409 `duplicate_seq`），不产生任何写入。
+- 整批在**单个 `BEGIN IMMEDIATE` 事务**内逐项核对「序号确为已定稿字幕（非缺口）且 `expected_version` 等于当前版本」；任一项失败即**整批零写入**，并按**输入顺序**返回各项冲突原因（409 `batch_conflict`，通过项 `error` 为 `null`）。
+- 全部通过才按**输入顺序**逐项追加新更正版本，返回批次号 `batch_id` 与逐项结果。
+- 幂等：同一频道携带相同 `idempotency_key` 且请求内容**完全相同**的重试返回**原批次结果**（`idempotent=true`，不会重复追加）；键相同而内容不同返回 409 `idempotency_key_conflict`；幂等键按频道隔离。
+- 只有全部通过的批次才占用幂等键；校验失败的批次零写入、零记录，修正内容后可用同一键重试。
+- 批量与单条更正共用同一更正链：版本号在同一 `(channel, seq)` 上统一递增，定稿原文不受影响。
 
 ### 发布快照规则
 
@@ -55,7 +64,7 @@
 docker compose up --build
 ```
 
-服务监听 **8000** 端口（容器内 `uvicorn --host 0.0.0.0 --port 8000`，Compose 映射 `8000:8000`），启动时自动初始化数据库（建表幂等，包括更正层、快照层与消费者游标新表及触发器，旧实例重启自动补建）。
+服务监听 **8000** 端口（容器内 `uvicorn --host 0.0.0.0 --port 8000`，Compose 映射 `8000:8000`），启动时自动初始化数据库（建表幂等，包括更正层、批次记录、快照层与消费者游标新表及触发器，旧实例重启自动补建）。
 
 - 交互式 API 文档：http://localhost:8000/docs
 - 健康检查：http://localhost:8000/health
@@ -63,6 +72,7 @@ docker compose up --build
 - 缺口裁决：`POST /channels/{channel}/gaps`
 - 定稿查询（`view=original|effective`）：`GET /channels/{channel}/finalized`
 - 追加更正：`POST /channels/{channel}/finalized/{seq}/corrections`
+- 批量更正（整批原子 + 幂等）：`POST /channels/{channel}/corrections/batch`
 - 更正审计（版本升序）：`GET /channels/{channel}/finalized/{seq}/corrections`
 - 创建发布快照：`POST /channels/{channel}/snapshots`
 - 分页拉取快照（`view=original|effective`）：`GET /snapshots/{snapshot_id}/items`
@@ -261,6 +271,73 @@ curl http://localhost:8000/channels/news/finalized/1/corrections
 ```
 
 没有更正的定稿序号返回 `current_version=0` 与空 `items`；缺口 / 未定稿 / 不存在的序号返回 HTTP 404。
+
+### 批量追加更正（整批原子 + 幂等）
+
+一次提交 **1～100 条**更正，整批在单个事务内原子核对与写入，并凭 `idempotency_key` 安全重试：
+
+```bash
+curl -X POST http://localhost:8000/channels/news/corrections/batch \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "idempotency_key": "fix-2026-09-26-001",
+        "items": [
+          {"seq": 1, "expected_version": 0, "text": "各位观众朋友们晚上好", "reason": "主持人改口"},
+          {"seq": 2, "expected_version": 1, "text": "第二条字幕（修订）", "reason": "翻译修订"}
+        ]
+      }'
+```
+
+请求字段：
+
+- `idempotency_key`（非空字符串）：频道范围内唯一的幂等键；
+- `items`（1～100 条）：每条含 `seq`（≥1）、`expected_version`（≥0）、`text` / `reason`（非空字符串，规则同单条更正）；同一批内 `seq` 不得重复。
+
+全部通过时按**输入顺序**逐项追加，返回批次号与逐项结果：
+
+```json
+{
+  "channel": "news",
+  "batch_id": "3f8a1c2e-....",
+  "idempotency_key": "fix-2026-09-26-001",
+  "idempotent": false,
+  "items": [
+    {"seq": 1, "correction_version": 1, "text": "各位观众朋友们晚上好", "reason": "主持人改口", "created_at": "2026-09-26T12:00:00.000Z"},
+    {"seq": 2, "correction_version": 2, "text": "第二条字幕（修订）", "reason": "翻译修订", "created_at": "2026-09-26T12:00:00.000Z"}
+  ],
+  "created_at": "2026-09-26T12:00:00.000Z"
+}
+```
+
+规则：
+
+- **整批原子**：逐项核对「序号已定稿且非缺口、`expected_version` 等于当前版本」在单个 `BEGIN IMMEDIATE` 事务内完成；任一项失败**整批零写入**，返回 409 `batch_conflict` 并按输入顺序给出各项结果（通过项 `error` 为 `null`）：
+
+```json
+{
+  "error": "batch_conflict",
+  "message": "批次内存在未通过校验的更正，整批未写入",
+  "items": [
+    {"seq": 1, "error": null, "message": null},
+    {"seq": 2, "error": "version_conflict", "message": "expected_version=1 与当前更正版本 2 不一致"},
+    {"seq": 3, "error": "seq_is_gap", "message": "序号 3 已裁决为永久缺口，不能更正"}
+  ]
+}
+```
+
+- **幂等重试**：相同频道 + 相同 `idempotency_key` + 完全相同请求的重试返回原批次结果（`idempotent=true`，`batch_id` 相同，不会重复追加）；键相同而内容不同返回 409 `idempotency_key_conflict`；只有全部通过的批次才占用幂等键，校验失败的批次可用同一键修正后重试；
+- **批内重复 `seq`** 返回 409 `duplicate_seq`，整批拒绝且不产生任何写入；
+- 批量与单条更正共用同一版本链与审计记录，`view=original` 的定稿原文不受影响。
+
+409 响应体（批量更正）：
+
+| `error`                     | 含义                                                              |
+| --------------------------- | ----------------------------------------------------------------- |
+| `duplicate_seq`             | 批内序号重复，整批拒绝                                            |
+| `idempotency_key_conflict`  | 幂等键已用于该频道另一批内容不同的更正                            |
+| `batch_conflict`            | 逐项校验存在失败（`items` 按输入顺序携带各项原因），整批零写入    |
+
+`batch_conflict` 时各项 `error` 取值与单条更正一致：`not_finalized` / `seq_is_gap` / `version_conflict`。
 
 ### 创建发布快照
 
@@ -489,7 +566,7 @@ curl http://localhost:8000/channels/news/consumers/worker-1
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                     # 含乱序、修订竞争、缺口裁决、幂等/重叠、更正版本冲突、视图合并、审计、发布快照冻结/幂等/分页/不可变、快照差异合并/分页/错误、消费者领取/确认/租约过期/并发、并发事务等用例
+pytest                     # 含乱序、修订竞争、缺口裁决、幂等/重叠、更正版本冲突、视图合并、审计、批量更正原子性/幂等/重复序号、发布快照冻结/幂等/分页/不可变、快照差异合并/分页/错误、消费者领取/确认/租约过期/并发、并发事务等用例
 uvicorn app.main:app --reload --port 8000
 ```
 
@@ -499,8 +576,9 @@ uvicorn app.main:app --reload --port 8000
 - **连续前缀推进**：`_consume_contiguous` 从给定水位线的下一位起逐条消费缓冲区，遇到第一个缺失即停止；片段补齐与缺口裁决都复用该逻辑。
 - **缺口存储**：`gap_decisions` 记录每次裁决区间及其当时释放到的序号（用于幂等返回原结果），`gaps` 按被跳过序号逐行落表，定稿查询用 `UNION ALL` 按序合并字幕与缺口标记。
 - **追加式更正层**：`corrections(channel, seq, version, text, reason, created_at)` 仅通过 `INSERT` 追加，`(channel, seq)` 外键引用 `finalized`——缺口或未定稿序号在存储层即无法插入；版本号按序号从 1 递增，`expected_version` 乐观并发控制 + `BEGIN IMMEDIATE` 保证竞争下唯一成功；`corrections_no_update` / `corrections_no_delete` 触发器在存储层禁止任何改写与删除，原始定稿保持不可变。生效视图用相关子查询连接每个序号的最新版本（`MAX(version)`）合并文本，审计查询按 `version` 升序返回完整历史。
+- **批量更正**：`POST /channels/{channel}/corrections/batch` 先校验批内无重复 `seq`，再在单个 `BEGIN IMMEDIATE` 事务内完成「幂等键查重 → 逐项核对（已定稿且非缺口 + 版本一致，全部核对完统一判定）→ 全部通过才按输入顺序逐项 `INSERT` → 记录批次」。任一项失败时校验阶段只读不写，直接返回即整批零写入；`correction_batches(batch_id, channel, idempotency_key, request_json, response_json, created_at)` 以 `UNIQUE(channel, idempotency_key)` 为幂等最后防线，`request_json` 为规范化请求内容（区分“相同请求重试”与“同键不同内容”），`response_json` 冻结成功时的批次号与逐项结果供重试原样返回；失败批次零记录、不占键。批次表同样配备 `no_update` / `no_delete` 触发器，落库的批次记录不可变。
 - **发布快照**：`snapshots(snapshot_id, channel, watermark, idempotency_key, created_at)` 记录冻结时刻，`snapshot_items(snapshot_id, seq, …)` 对 `1..watermark` 每个序号落一行——字幕行同时存 `original_text`、创建时刻经 `MAX(version)` 连接冻结的 `effective_text` 及其 `correction_version`，缺口行存裁决区间端点；`snapshot_corrections(snapshot_id, seq, version, …)` 逐版本复制快照时刻已有的全部更正记录。创建先按 `(channel, idempotency_key)` 查重，命中即幂等返回；全部插入在一个写事务内完成，故冻结视图与锁定水位线严格一致。三张快照表各自配备 `no_update` / `no_delete` 触发器，快照一旦生成在存储层即不可变；分页与快照内审计只读取快照表，后续定稿、更正、缺口对其零影响。不存在的频道不写 `channels` 行，直接生成 `watermark=0` 的空快照。
 - **快照差异**：`GET /snapshots/{snapshot_id}/diff?other=…` 在单个只读事务内校验两快照存在且同频道（不存在 404、跨频道 409），随后用两段 `LEFT JOIN` 的 `UNION ALL` 模拟全外连接，把两份 `snapshot_items` 按 `seq` 合并：第一段覆盖“基准有 / 双方都有且有差异”，第二段补齐“仅对方有”。差异判定用 SQLite 的 NULL 安全不等号 `IS NOT` 比较冻结的 `effective_text`、`correction_version`（字幕）与 `start_seq` / `end_seq`（缺口），完全一致的行在 SQL 层即被过滤，`ORDER BY seq LIMIT` 只作用于差异行——因此 `limit` 天然只计差异条目，稀疏差异也不会漏项；`next_after` 取本页最后一条差异的 `seq` 供续拉。
 - **命名消费者拉取游标**：`consumers(channel, consumer, cursor, lease_token, lease_from, lease_to, lease_expires_at, …)` 每消费者一行。领取在单个 `BEGIN IMMEDIATE` 事务内「注册消费者 → 校验无未过期租约 → 复用定稿查询截取 `cursor` 后的连续批次（含缺口标记）→ 写入新租约（UUID 令牌 + 过期时刻 epoch 秒）」，并发领取同一消费者只有一个能拿到租约；确认同样单事务完成全部校验（游标一致 → 有租约 → 令牌匹配 → 未过期 → `new_cursor` 在批次范围内）后推进游标并清空租约，任何一步失败都不改写状态。租约过期由应用层按 `lease_expires_at` 判定，过期后同一未确认批次可被重新领取并签发新令牌（旧令牌随之失效），确认成功即清空租约、下一批从新游标继续，实现至少一次交付。
-- **存储**：`channels`（水位线）、`fragments`（待定稿缓冲）、`finalized`（定稿，不可变）、`gap_decisions` / `gaps`（永久缺口）、`corrections`（追加式更正）、`snapshots` / `snapshot_items` / `snapshot_corrections`（不可变发布快照）、`consumers`（命名消费者拉取游标）十张表；WAL 模式 + `busy_timeout`。建表语句与触发器均幂等（`CREATE TABLE/TRIGGER IF NOT EXISTS`），已部署实例重启后自动补建新表与触发器，原有数据与接口行为不受影响。
+- **存储**：`channels`（水位线）、`fragments`（待定稿缓冲）、`finalized`（定稿，不可变）、`gap_decisions` / `gaps`（永久缺口）、`corrections`（追加式更正）、`correction_batches`（批量更正幂等记录）、`snapshots` / `snapshot_items` / `snapshot_corrections`（不可变发布快照）、`consumers`（命名消费者拉取游标）十一张表；WAL 模式 + `busy_timeout`。建表语句与触发器均幂等（`CREATE TABLE/TRIGGER IF NOT EXISTS`），已部署实例重启后自动补建新表与触发器，原有数据与接口行为不受影响。
 - **容器化**：`docker compose up --build` 一键启动，数据库落在命名卷 `subtitles-data`；服务固定监听 **8000** 端口。

@@ -17,10 +17,12 @@ from app.main import app
 def clean_db():
     init_db()
     with write_tx() as conn:
-        # corrections / 快照表带有禁止 DELETE 的不可变触发器：清空时先摘除触发器，
+        # corrections / 快照表 / 批次记录带有禁止 DELETE 的不可变触发器：清空时先摘除触发器，
         # 删除后由 init_db() 幂等重建
         conn.execute("DROP TRIGGER IF EXISTS corrections_no_delete")
         conn.execute("DROP TRIGGER IF EXISTS corrections_no_update")
+        conn.execute("DROP TRIGGER IF EXISTS correction_batches_no_delete")
+        conn.execute("DROP TRIGGER IF EXISTS correction_batches_no_update")
         conn.execute("DROP TRIGGER IF EXISTS snapshot_corrections_no_delete")
         conn.execute("DROP TRIGGER IF EXISTS snapshot_corrections_no_update")
         conn.execute("DROP TRIGGER IF EXISTS snapshot_items_no_delete")
@@ -31,6 +33,7 @@ def clean_db():
         conn.execute("DELETE FROM snapshot_corrections")
         conn.execute("DELETE FROM snapshot_items")
         conn.execute("DELETE FROM snapshots")
+        conn.execute("DELETE FROM correction_batches")
         conn.execute("DELETE FROM corrections")
         conn.execute("DELETE FROM finalized")
         conn.execute("DELETE FROM fragments")

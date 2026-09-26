@@ -89,6 +89,34 @@ BEGIN
     SELECT RAISE(ABORT, 'corrections is append-only: DELETE is forbidden');
 END;
 
+-- 批量更正的幂等记录：每个全部通过并已写入的批次一行。
+-- (channel, idempotency_key) 唯一：同一频道内同一幂等键只对应一个批次；
+-- request_json 为规范化后的请求内容（items 按输入顺序），用于区分
+-- “相同请求重试”与“同键不同内容”；response_json 冻结成功时的批次号与
+-- 逐项结果，重试时原样返回。校验失败的批次零写入、零记录，不占幂等键。
+CREATE TABLE IF NOT EXISTS correction_batches (
+    batch_id        TEXT PRIMARY KEY,
+    channel         TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_json    TEXT NOT NULL,
+    response_json   TEXT NOT NULL,
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE (channel, idempotency_key)
+);
+
+-- 批次记录同样不可变：已落库的批次结果是幂等重试的唯一依据
+CREATE TRIGGER IF NOT EXISTS correction_batches_no_update
+BEFORE UPDATE ON correction_batches
+BEGIN
+    SELECT RAISE(ABORT, 'correction_batches is append of record: UPDATE is forbidden');
+END;
+
+CREATE TRIGGER IF NOT EXISTS correction_batches_no_delete
+BEFORE DELETE ON correction_batches
+BEGIN
+    SELECT RAISE(ABORT, 'correction_batches is append-only: DELETE is forbidden');
+END;
+
 -- 发布快照：创建时刻在同一事务内冻结频道 watermark。下游按 snapshot_id
 -- 分批拉取，后续字幕 / 更正 / 缺口只写入原表，任何既有快照都不再变化。
 -- idempotency_key 在频道范围内唯一：重试同一 key 必须返回同一快照。

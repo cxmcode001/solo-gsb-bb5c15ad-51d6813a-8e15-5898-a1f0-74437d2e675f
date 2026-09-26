@@ -156,6 +156,80 @@ class ErrorResponse(BaseModel):
     message: str
 
 
+# ---------- 批量更正 ----------
+
+
+class BatchCorrectionItemIn(CorrectionIn):
+    seq: int = Field(..., ge=1, description="要更正的定稿序号（同一批内不得重复）")
+
+
+class BatchCorrectionIn(BaseModel):
+    idempotency_key: str = Field(
+        ...,
+        min_length=1,
+        description=(
+            "幂等键（频道范围内唯一）：相同频道 + 相同键 + 完全相同请求的重试"
+            "返回原批次结果；键相同而内容不同返回 409 冲突"
+        ),
+    )
+    items: List[BatchCorrectionItemIn] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description="本批更正（1～100 条），按输入顺序逐项核对与追加",
+    )
+
+    @field_validator("idempotency_key")
+    @classmethod
+    def _strip_and_require_nonblank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("不得为空白字符串")
+        return v
+
+
+class BatchCorrectionItemResult(BaseModel):
+    seq: int = Field(..., description="被更正的定稿序号")
+    correction_version: int = Field(..., description="本次追加后该序号的更正版本")
+    text: str = Field(..., description="本次更正文本（原始定稿不受影响）")
+    reason: str
+    created_at: str = Field(..., description="该条更正落库时间（UTC ISO8601）")
+
+
+class BatchCorrectionResponse(BaseModel):
+    channel: str
+    batch_id: str = Field(..., description="批次号（UUID）；幂等重试返回同一批次")
+    idempotency_key: str
+    idempotent: bool = Field(
+        ...,
+        description="false=本次新批次；true=相同幂等键与相同内容的重试，返回原批次结果",
+    )
+    items: List[BatchCorrectionItemResult] = Field(
+        ..., description="逐项结果，顺序与请求 items 一致"
+    )
+    created_at: str = Field(..., description="批次落库时间（UTC ISO8601）")
+
+
+class BatchCorrectionItemError(BaseModel):
+    seq: int
+    error: Optional[str] = Field(
+        None, description="该项冲突原因（not_finalized / seq_is_gap / version_conflict）；通过校验的项为 null"
+    )
+    message: Optional[str] = Field(None, description="冲突详情；通过校验的项为 null")
+
+
+class BatchConflictResponse(BaseModel):
+    error: str = Field(
+        ..., description="错误码：duplicate_seq / idempotency_key_conflict / batch_conflict"
+    )
+    message: str
+    items: Optional[List[BatchCorrectionItemError]] = Field(
+        None,
+        description="batch_conflict 时按输入顺序给出各项校验结果（未通过项携带 error/message）；"
+        "其他错误码时为 null",
+    )
+
+
 # ---------- 发布快照 ----------
 
 
